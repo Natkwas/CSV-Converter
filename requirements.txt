@@ -1,0 +1,5 @@
+pdfplumber
+python-dateutil
+tkinterdnd2
+rapidocr-onnxruntime
+requests
