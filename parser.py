@@ -385,7 +385,11 @@ def _merge_adjacent_words(row: list[dict], fullmatch_test) -> list[dict]:
     return merged
 
 
-CORRUPTED_NUMERIC_RE = re.compile(r"^\(?-?\d[\d,.\s]*[A-Za-z]+[\d,.\s]*\)?-?$")
+# Legitimate amounts routinely end with one of these glued directly onto the
+# number (e.g. "468,270.87Dr", "10,292.50Cr") -- strip it before judging a
+# token corrupted, or every such amount would otherwise look exactly like a
+# digit-misread-as-letter OCR error.
+_KNOWN_AMOUNT_SUFFIXES = ("DR", "CR")
 
 
 def _page_text_looks_corrupted(words: list[dict]) -> bool:
@@ -398,10 +402,29 @@ def _page_text_looks_corrupted(words: list[dict]) -> bool:
     -- a shape normal words and alphanumeric reference codes (which start
     with a letter, not a digit) never take.
     """
-    return any(CORRUPTED_NUMERIC_RE.match(w["text"].strip()) for w in words)
+    for w in words:
+        t = w["text"].strip()
+        if not t or not t[0].isdigit():
+            continue
+        body = t[1:-1] if t.startswith("(") and t.endswith(")") else t
+        upper = body.upper()
+        for suffix in _KNOWN_AMOUNT_SUFFIXES:
+            if upper.endswith(suffix):
+                body = body[: -len(suffix)]
+                break
+        if body.endswith(("-", "*")):
+            body = body[:-1]
+        # A reference/account code starting with digits (e.g. "00Cli2521868",
+        # a date fragment like "31-Aug") can also mix in letters without
+        # being corrupted -- the real tell is a comma/period thousands or
+        # decimal separator (the shape a plain reference code never has)
+        # alongside the stray letter.
+        if any(ch.isalpha() for ch in body) and any(ch in ",." for ch in body):
+            return True
+    return False
 
 
-def _bucket_for_amount(word: dict, col_x: dict[str, float]) -> str:
+def _bucket_for_amount(word: dict, col_x: dict[str, float]) -> str | None:
     """Which money column a word belongs to, based on the header's x-positions.
 
     Compares the word's RIGHT edge against each header's LEFT edge, not
@@ -414,17 +437,23 @@ def _bucket_for_amount(word: dict, col_x: dict[str, float]) -> str:
     x1. The date column is never a candidate -- an amount can legitimately
     overflow past where a narrow "Date" header sits, and a value is never
     actually part of the date.
+
+    Returns None for a word that sits to the left of EVERY money column --
+    e.g. a small foreign-currency disclosure amount printed before the
+    merchant name on a card purchase (" POS Purchase 9.32 Google Workspa
+    ..."). That's still part of the description, not a real column value,
+    and must not be mistaken for one (the leftmost column) by default.
     """
     candidates = {k: v for k, v in col_x.items() if k != "date"}
     ordered = sorted(candidates.items(), key=lambda kv: kv[1])
     x1 = word.get("x1", word["x0"])
-    idx = 0
+    idx = None
     for i, (_role, x0) in enumerate(ordered):
         if x0 <= x1:
             idx = i
         else:
             break
-    return ordered[idx][0]
+    return ordered[idx][0] if idx is not None else None
 
 
 def _classify_header_word(text: str) -> str | None:
@@ -524,7 +553,13 @@ def _rows_from_word_rows(rows: list[list[dict]], fallback_year: str | None = Non
         date_word = next((w for w in row if DATE_RE.fullmatch(w["text"].strip())), None)
 
         def is_amount(w):
-            default_neg = amount_default_negative if col_x and _bucket_for_amount(w, col_x) == "amount" else False
+            if col_x:
+                bucket = _bucket_for_amount(w, col_x)
+                if bucket is None:
+                    return False  # left of every money column -- part of the description
+                default_neg = amount_default_negative if bucket == "amount" else False
+            else:
+                default_neg = False
             return _token_amount(w["text"], default_neg) is not None
 
         amount_words = [w for w in row if w is not date_word and is_amount(w)]
