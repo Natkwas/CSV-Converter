@@ -18,7 +18,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import license_client
 import updater
-from parser import PdfPasswordRequired, extract_rows, parse_date
+from parser import PdfPasswordRequired, extract_rows, parse_date, reconcile
 
 DATE_FORMATS = {
     "YYYY-MM-DD": "%Y-%m-%d",
@@ -160,6 +160,90 @@ class AccountDialog(tk.Toplevel):
         ttk.Button(buttons, text="Sign Up", command=sign_up).pack(side=tk.LEFT, padx=4)
 
 
+class ReportIssueDialog(tk.Toplevel):
+    """Opt-in "report a bad conversion" form. Nothing is sent until the user
+    fills this in and clicks Send -- see license_client.submit_bug_report()
+    and backend/supabase/migrations/0002_bug_reports.sql."""
+
+    def __init__(self, master: "App"):
+        super().__init__(master)
+        self.title("Report an Issue")
+        self.resizable(False, False)
+        self.transient(master)
+        self._master_app = master
+        self._build()
+        self.grab_set()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=16)
+        frame.pack()
+
+        ttk.Label(frame, text="Bank / statement type:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        bank_var = tk.StringVar(value=self._master_app._last_bank_name)
+        ttk.Entry(frame, textvariable=bank_var, width=48).grid(row=0, column=1, pady=4, sticky=tk.W)
+
+        ttk.Label(frame, text="What went wrong:").grid(row=1, column=0, sticky=tk.NW, pady=4)
+        details_text = tk.Text(frame, width=48, height=6, wrap=tk.WORD)
+        details_text.grid(row=1, column=1, pady=4, sticky=tk.W)
+
+        include_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Include the parsed table shown below (dates, amounts, descriptions)",
+            variable=include_var,
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        ttk.Label(
+            frame,
+            text="Off by default. Descriptions can contain merchant/payee names. The original\n"
+            "PDF is never sent either way -- only what you explicitly check here.",
+            foreground="gray30",
+            justify=tk.LEFT,
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+
+        status_var = tk.StringVar()
+        status_label = ttk.Label(frame, textvariable=status_var, wraplength=380)
+        status_label.grid(row=4, column=0, columnspan=2, sticky=tk.W)
+
+        def send():
+            details = details_text.get("1.0", tk.END).strip()
+            if not details:
+                status_var.set("Please describe what went wrong.")
+                return
+            sample_rows = list(self._master_app.rows.values()) if include_var.get() else None
+            send_button.state(["disabled"])
+            status_var.set("Sending...")
+
+            def worker():
+                try:
+                    license_client.submit_bug_report(
+                        bank_name=bank_var.get().strip(),
+                        details=details,
+                        app_version=updater.APP_VERSION,
+                        used_ocr=self._master_app._any_used_ocr,
+                        sample_rows=sample_rows,
+                    )
+                except license_client.LicenseError as exc:
+                    self.after(0, lambda: self._finish(status_var, send_button, f"Couldn't send: {exc}"))
+                    return
+                self.after(0, lambda: self._finish(status_var, send_button, None))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=2, pady=(10, 0))
+        send_button = ttk.Button(buttons, text="Send", command=send)
+        send_button.pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=4)
+
+    def _finish(self, status_var: tk.StringVar, send_button: ttk.Button, error: str | None):
+        if error:
+            send_button.state(["!disabled"])
+            status_var.set(error)
+            return
+        messagebox.showinfo("Thanks", "Report sent -- thank you for helping improve this.", parent=self)
+        self.destroy()
+
+
 class App(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
@@ -170,6 +254,8 @@ class App(TkinterDnD.Tk):
         self.rows: dict[str, dict] = {}  # treeview iid -> {"date", "description", "amount"}
         self._next_id = 0
         self._last_export_remaining: int | None = None
+        self._any_used_ocr = False
+        self._last_bank_name = ""
 
         self._build_toolbar()
         self._build_table()
@@ -263,6 +349,7 @@ class App(TkinterDnD.Tk):
         ).pack(side=tk.LEFT)
 
         ttk.Button(bar, text="Export CSV...", command=self.export_csv).pack(side=tk.RIGHT)
+        ttk.Button(bar, text="Report Issue...", command=self.open_report_issue_dialog).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(bar, text="Account", command=self.open_account_dialog).pack(side=tk.RIGHT, padx=(0, 6))
         self.account_var = tk.StringVar()
         ttk.Label(bar, textvariable=self.account_var).pack(side=tk.RIGHT, padx=(0, 6))
@@ -292,6 +379,10 @@ class App(TkinterDnD.Tk):
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Rows flagged by balance reconciliation as not adding up -- worth a
+        # second look before exporting (see reconcile() in parser.py).
+        self.tree.tag_configure("mismatch", background="#ffd6d6")
 
         self.tree.bind("<Control-a>", lambda _e: (self.select_all(), "break")[1])
 
@@ -360,8 +451,9 @@ class App(TkinterDnD.Tk):
 
     def _extract_with_password_retry(self, path, failed):
         """Try to parse one PDF, prompting for a password (and re-prompting
-        on a wrong one) if it's encrypted. Returns None (and appends to
-        failed) if parsing ultimately fails or the user cancels."""
+        on a wrong one) if it's encrypted. Returns an ExtractionResult, or
+        None (and appends to failed) if parsing ultimately fails or the
+        user cancels."""
         password = None
         wrong_password = False
         while True:
@@ -385,26 +477,52 @@ class App(TkinterDnD.Tk):
     def _load_pdfs(self, paths):
         total_added = 0
         failed = []
+        report_lines = []
+        any_mismatch = False
+
         for path in paths:
-            extracted = self._extract_with_password_retry(path, failed)
-            if extracted is None:
+            result = self._extract_with_password_retry(path, failed)
+            if result is None:
                 continue
-            for row in extracted:
-                self._add_row(row.date, row.description, row.amount, row.fee)
-            total_added += len(extracted)
+
+            recon = reconcile(result.rows)
+            mismatched_indices = {m.row_index for m in recon.mismatches}
+            for i, row in enumerate(result.rows):
+                self._add_row(row.date, row.description, row.amount, row.fee, mismatch=i in mismatched_indices)
+            total_added += len(result.rows)
+            self._any_used_ocr = self._any_used_ocr or result.used_ocr
+            self._last_bank_name = os.path.splitext(os.path.basename(path))[0]
+
+            name = os.path.basename(path)
+            if not recon.applicable:
+                status = "no running balance in this statement to check"
+            elif recon.ok:
+                status = f"reconciled ({recon.checked} row(s) checked)"
+            else:
+                any_mismatch = True
+                status = f"{len(recon.mismatches)} of {recon.checked} row(s) don't reconcile -- see rows highlighted in red"
+            if result.used_ocr:
+                status += " -- OCR was used on this file, so results are less certain than a native-text statement"
+            report_lines.append(f"{name}: {status}")
 
         if failed:
             messagebox.showwarning("Some files had issues", "\n".join(failed))
+
+        if report_lines:
+            title = "Some statements need review" if any_mismatch else "Reconciliation check"
+            dialog = messagebox.showwarning if any_mismatch else messagebox.showinfo
+            dialog(title, "\n\n".join(report_lines))
 
         self.status_var.set(
             f"Added {total_added} transaction(s) from {len(paths)} file(s). "
             f"Review the rows below, fix anything wrong, then export."
         )
 
-    def _add_row(self, date: str, description: str, amount: str, fee: str = ""):
+    def _add_row(self, date: str, description: str, amount: str, fee: str = "", mismatch: bool = False):
         self._next_id += 1
         iid = f"row{self._next_id}"
-        self.tree.insert("", tk.END, iid=iid, values=(date, description, amount, fee))
+        tags = ("mismatch",) if mismatch else ()
+        self.tree.insert("", tk.END, iid=iid, values=(date, description, amount, fee), tags=tags)
         self.rows[iid] = {"date": date, "description": description, "amount": amount, "fee": fee}
 
     def _on_cell_edited(self, row_id: str, column: str, new_value: str):
@@ -435,7 +553,19 @@ class App(TkinterDnD.Tk):
         if messagebox.askyesno("Clear all", "Remove every parsed row?"):
             self.tree.delete(*self.tree.get_children())
             self.rows.clear()
+            self._any_used_ocr = False
+            self._last_bank_name = ""
             self.status_var.set("Cleared. Open one or more PDF bank statements to get started.")
+
+    def open_report_issue_dialog(self):
+        if not license_client.is_configured():
+            messagebox.showinfo(
+                "Not set up yet",
+                "The account backend hasn't been configured yet, so there's nowhere to send a "
+                "report to -- see backend/README.md.",
+            )
+            return
+        ReportIssueDialog(self)
 
     def _check_usage_allows_export(self) -> bool:
         """Gate point for the subscription model. Returns True if the export

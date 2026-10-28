@@ -22,7 +22,7 @@ import zipfile
 
 import requests
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 # Set once the GitHub repo exists, e.g. "yourusername/bank-statement-converter".
 GITHUB_REPO = os.environ.get("UPDATE_REPO", "Natkwas/CSV-Converter")

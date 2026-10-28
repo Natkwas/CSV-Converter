@@ -9,17 +9,19 @@
 //
 // Required secrets (set with `supabase secrets set`):
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  (service role, NOT the anon key)
+//   PAYFAST_MERCHANT_ID, PRO_MONTHLY_PRICE   (must match license_client.py's
+//   values -- these gate which notifications are trusted, see below)
 //
 // NOTE: this is a starting point, not a drop-in. Confirm the exact ITN
 // field names and the subscription billing-cycle fields against PayFast's
-// current docs before going live, and consider also verifying the
-// `pfData`/signature per PayFast's recommended validation steps beyond the
-// server-to-server "VALID" check already done here.
+// current docs before going live.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const PAYFAST_VALIDATE_URL =
   Deno.env.get("PAYFAST_VALIDATE_URL") ?? "https://www.payfast.co.za/eng/query/validate";
+const EXPECTED_MERCHANT_ID = Deno.env.get("PAYFAST_MERCHANT_ID") ?? "10056596";
+const EXPECTED_AMOUNT = parseFloat(Deno.env.get("PRO_MONTHLY_PRICE") ?? "99.00");
 
 const supabaseAdmin = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -53,12 +55,27 @@ Deno.serve(async (req) => {
   const paymentStatus = params.get("payment_status"); // COMPLETE, FAILED, CANCELLED, ...
   const subscriptionToken = params.get("token"); // PayFast recurring-billing token
   const pfPaymentId = params.get("pf_payment_id");
+  const merchantId = params.get("merchant_id");
+  const amountGross = parseFloat(params.get("amount_gross") ?? "0");
 
   if (!userId) {
     return new Response("Missing custom_str1 (user id)", { status: 400 });
   }
 
+  // The "VALID" round-trip above only confirms PayFast itself sent this
+  // notification -- it does NOT confirm it's for OUR product at OUR price.
+  // Without these two checks, a replay of any other genuine (but unrelated,
+  // e.g. far cheaper) PayFast notification against this same endpoint would
+  // still pass validation and could grant Pro access for free.
+  if (merchantId !== EXPECTED_MERCHANT_ID) {
+    console.error(`merchant_id mismatch: got ${merchantId}`);
+    return new Response("Merchant ID mismatch", { status: 400 });
+  }
   const isActive = paymentStatus === "COMPLETE";
+  if (isActive && amountGross < EXPECTED_AMOUNT - 0.01) {
+    console.error(`amount_gross too low: got ${amountGross}, expected >= ${EXPECTED_AMOUNT}`);
+    return new Response("Amount mismatch", { status: 400 });
+  }
 
   const { error } = await supabaseAdmin
     .from("subscriptions")

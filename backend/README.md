@@ -17,6 +17,7 @@ oddly.
 backend/
   supabase/
     migrations/0001_init.sql     # schema: profiles, subscriptions, usage_counters
+    migrations/0002_bug_reports.sql  # opt-in "report a bad conversion" table (write-only from the client)
     functions/payfast-webhook/   # updates a user's subscription when PayFast confirms payment
   .env.example                   # config template
 
@@ -45,9 +46,10 @@ license_client.py                # at the project root -- imported by app.py
 ## Setup
 
 1. **Create a Supabase project** at [supabase.com](https://supabase.com) (free tier is enough to start).
-2. **Run the migration**: paste `supabase/migrations/0001_init.sql` into the
-   Supabase SQL editor and run it, or if you have the
-   [Supabase CLI](https://supabase.com/docs/guides/cli): `supabase db push`.
+2. **Run the migrations**: paste `supabase/migrations/0001_init.sql`, then
+   `0002_bug_reports.sql`, into the Supabase SQL editor and run each, or if
+   you have the [Supabase CLI](https://supabase.com/docs/guides/cli):
+   `supabase db push`.
 3. **Set `SUPABASE_URL` and the anon key** (Project Settings -> API) --
    either edit the defaults at the top of `license_client.py` directly, or
    set the `SUPABASE_URL` / `SUPABASE_ANON_KEY` environment variables
@@ -56,8 +58,18 @@ license_client.py                # at the project root -- imported by app.py
 4. **Deploy the webhook** (requires the Supabase CLI and `supabase login` / `supabase link`):
    ```bash
    supabase secrets set SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+   supabase secrets set PAYFAST_MERCHANT_ID=your-merchant-id
+   supabase secrets set PRO_MONTHLY_PRICE=99.00
    supabase functions deploy payfast-webhook --no-verify-jwt
    ```
+   `PAYFAST_MERCHANT_ID`/`PRO_MONTHLY_PRICE` must match `license_client.py`'s
+   values -- the webhook rejects any notification for a different merchant
+   or a lower amount than expected (otherwise a replay of any other genuine
+   PayFast notification, for an unrelated and possibly far cheaper payment,
+   would still pass PayFast's own "VALID" check and could grant Pro access
+   for free). If you already deployed this function before these checks
+   existed, redeploy it.
+
    Note the deployed function URL -- you'll need it for step 5.
 5. **Set up PayFast**: create a merchant account, then when you build the
    checkout request, set `custom_str1` to the user's Supabase auth UUID
@@ -84,9 +96,34 @@ license_client.py                # at the project root -- imported by app.py
   choice to protect the subscription model over convenience; revisit if
   you'd rather allow a few offline exports as a grace fallback).
 - The status bar shows remaining free-tier exports after each one.
-- Still missing: an actual "Upgrade" link/button wired to a real PayFast
-  checkout URL once you have one -- currently the free-tier-exhausted
-  message doesn't link anywhere yet.
+- An **Upgrade to Pro...** button (in the Account dialog, and offered
+  automatically when the free tier is exhausted) opens a real signed
+  PayFast checkout in the browser.
+
+## Security notes
+
+- **Row Level Security**: every table (`profiles`, `subscriptions`,
+  `usage_counters`) has RLS enabled with only a `select ... using (auth.uid()
+  = ...)` policy -- no insert/update/delete policy exists for the
+  `anon`/`authenticated` roles at all, so the anon key can read a signed-in
+  user's own row and nothing else, and can't write anything directly. All
+  writes happen through `check_and_increment_usage()` (`SECURITY DEFINER`,
+  scoped to the calling `auth.uid()` only) or the webhook's service-role
+  key. To confirm this yourself against your live project: sign in as two
+  different test users, and with user A's access token, try
+  `GET {SUPABASE_URL}/rest/v1/subscriptions?select=*` with header
+  `Authorization: Bearer <user A's token>` -- it should return only user
+  A's row, never user B's, no matter what `user_id` you put in the query
+  string.
+- **PayFast verification**: the webhook never trusts the client. It
+  round-trips every notification to PayFast's own `validate` endpoint (the
+  officially documented check), and additionally rejects anything where
+  `merchant_id` or the paid amount don't match what's expected (see the
+  Deploy step above) -- only then does it flip `tier` to `'pro'`, and only
+  from inside the Edge Function using the service-role key.
+- **Free tier limit**: enforced by `check_and_increment_usage()` server-side
+  against `usage_counters`, not a local counter -- resetting the app or
+  editing local files can't grant more exports.
 
 ## Costs
 

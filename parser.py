@@ -106,6 +106,7 @@ class Row:
     description: str
     amount: str
     fee: str = ""
+    balance: str = ""  # this row's own printed running balance, when the statement has one (internal use: reconciliation only, not exported to CSV)
 
 
 def clean_amount(raw: str) -> float | None:
@@ -566,6 +567,7 @@ def _rows_from_word_rows(rows: list[list[dict]], fallback_year: str | None = Non
         text_words = [w for w in row if w is not date_word and not is_amount(w)]
 
         fee_val = 0.0
+        balance_val: float | None = None
         if col_x:
             net = 0.0
             found = False
@@ -587,6 +589,8 @@ def _rows_from_word_rows(rows: list[list[dict]], fallback_year: str | None = Non
                 elif bucket == "fee":
                     fee_val += value
                     found = True
+                elif bucket == "balance":
+                    balance_val = value
         else:
             found = bool(amount_words)
             net = 0.0
@@ -618,7 +622,8 @@ def _rows_from_word_rows(rows: list[list[dict]], fallback_year: str | None = Non
 
         description = " ".join(w["text"] for w in text_words).strip()
         fee_str = f"{fee_val:.2f}" if fee_val else ""
-        out.append(Row(date=last_date, description=description, amount=f"{net:.2f}", fee=fee_str))
+        balance_str = f"{balance_val:.2f}" if balance_val is not None else ""
+        out.append(Row(date=last_date, description=description, amount=f"{net:.2f}", fee=fee_str, balance=balance_str))
 
     return out
 
@@ -829,8 +834,15 @@ class PdfPasswordRequired(Exception):
     """The PDF is encrypted and needs a password (wrong or no password given)."""
 
 
-def extract_rows(pdf_path: str, password: str | None = None) -> list[Row]:
+@dataclass
+class ExtractionResult:
+    rows: list[Row]
+    used_ocr: bool  # true if any page needed (re-)OCRing -- flag it for the user, it's less reliable than native text
+
+
+def extract_rows(pdf_path: str, password: str | None = None) -> ExtractionResult:
     rows: list[Row] = []
+    used_ocr = False
     ocr_engine = "not loaded yet"
     try:
         pdf_cm = pdfplumber.open(pdf_path, password=password or "")
@@ -876,10 +888,91 @@ def extract_rows(pdf_path: str, password: str | None = None) -> list[Row]:
                     ocr_engine = _get_ocr_engine()
                 if ocr_engine is not None:
                     page_rows = _rows_from_ocr_page(page, ocr_engine, fallback_year)
+                    used_ocr = True
                 elif corrupted_scan:
                     # No OCR engine available -- fall back to the (known-flawed)
                     # native reading rather than returning nothing for this page.
                     page_rows = _rows_from_words(words, fallback_year)
 
             rows.extend(page_rows)
-    return rows
+    return ExtractionResult(rows=rows, used_ocr=used_ocr)
+
+
+@dataclass
+class ReconciliationMismatch:
+    row_index: int
+    row: Row
+    expected_balance: float
+    printed_balance: float
+
+
+@dataclass
+class ReconciliationResult:
+    applicable: bool  # False if this statement format prints no running balance to check against
+    checked: int
+    mismatches: list[ReconciliationMismatch]
+
+    @property
+    def ok(self) -> bool:
+        return self.applicable and not self.mismatches
+
+
+def reconcile(rows: list[Row], tolerance: float = 0.02) -> ReconciliationResult:
+    """Row-by-row check: does each transaction's own printed running balance
+    follow from the previous one plus this transaction's amount? This is the
+    strongest accuracy check available -- it catches a misread digit (most
+    likely on an OCR'd statement) that would otherwise slip through silently,
+    since a wrong amount almost never still adds up to the next balance.
+
+    Only applicable to statement formats that print a running balance per
+    row (most current/cheque/business accounts) -- a sectioned, credit-card
+    -style statement with no such column can't be checked this way, and
+    reports applicable=False rather than a false "reconciled".
+
+    The sign convention (does a positive amount increase or decrease the
+    printed balance?) isn't fixed -- a plain balance grows with credits
+    (Standard Bank, Capitec, ...), while a "Dr" balance grows with debits
+    instead (seen on an FNB Gold Business account) -- so it's inferred from
+    the statement's own first transition rather than assumed, and then held
+    fixed for the rest of the statement.
+
+    A row with no balance of its own (e.g. a wrapped/merged line) doesn't
+    break the chain: its amount is carried forward and folded into the next
+    row that does have one, rather than silently skipped.
+    """
+    if sum(1 for r in rows if r.balance) < 2:
+        return ReconciliationResult(applicable=False, checked=0, mismatches=[])
+
+    sign: float | None = None
+    mismatches: list[ReconciliationMismatch] = []
+    checked = 0
+    prev_balance: float | None = None
+    pending = 0.0
+
+    for idx, row in enumerate(rows):
+        amount = float(row.amount)
+        if not row.balance:
+            pending += amount
+            continue
+
+        this_balance = float(row.balance)
+        movement = pending + amount
+        pending = 0.0
+
+        if prev_balance is None:
+            prev_balance = this_balance
+            continue
+
+        if sign is None:
+            err_pos = abs((prev_balance + movement) - this_balance)
+            err_neg = abs((prev_balance - movement) - this_balance)
+            sign = 1.0 if err_pos <= err_neg else -1.0
+
+        expected = prev_balance + sign * movement
+        checked += 1
+        if abs(expected - this_balance) > tolerance:
+            mismatches.append(ReconciliationMismatch(idx, row, expected, this_balance))
+
+        prev_balance = this_balance
+
+    return ReconciliationResult(applicable=True, checked=checked, mismatches=mismatches)

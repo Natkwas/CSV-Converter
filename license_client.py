@@ -171,6 +171,35 @@ def check_and_increment_usage(limit: int = FREE_TIER_LIMIT) -> dict:
     return resp.json()
 
 
+def submit_bug_report(
+    bank_name: str,
+    details: str,
+    app_version: str | None = None,
+    used_ocr: bool | None = None,
+    sample_rows: list[dict] | None = None,
+) -> None:
+    """Opt-in only -- call this ONLY after the user explicitly asks to send
+    a report (e.g. clicks "Report an Issue" and confirms). Never call this
+    automatically; nothing is collected silently. `sample_rows`, if passed,
+    should already be whatever the user agreed to include -- this function
+    does no redaction itself. Write-only on the server (see
+    backend/supabase/migrations/0002_bug_reports.sql): not even the
+    submitting user can read reports back with the anon key.
+    """
+    _post(
+        f"{SUPABASE_URL}/rest/v1/bug_reports",
+        headers={"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"},
+        json={
+            "user_id": current_user_id(),
+            "bank_name": bank_name,
+            "details": details,
+            "app_version": app_version,
+            "used_ocr": used_ocr,
+            "sample_rows": sample_rows,
+        },
+    )
+
+
 def _php_urlencode(value: str) -> str:
     """Match PHP's urlencode() exactly (spaces -> '+', uppercase hex, and --
     unlike Python's quote_plus, which treats it as always-safe -- '~' percent
